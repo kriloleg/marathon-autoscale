@@ -5,23 +5,25 @@ import requests
 import json
 import math
 import time
+import os
 
-dcos_master = input("Enter the DNS hostname or IP of your DCOS Master Instance(http://<dcos-master-ip>) : ")
-#max_mem_percent = int(input("Enter the Max percent of Mem Usage averaged across all Application Instances to trigger Autoscale (ie. 80) : "))
-#max_cpu_time = int(input("Enter the Max percent of CPU Usage averaged across all Application Instances to trigger Autoscale (ie. 80) : "))
-#trigger_mode = input("Enter which metric(s) to trigger Autoscale ('and', 'or') : ")
-#autoscale_multiplier = float(input("Enter Autoscale multiplier for triggered Autoscale (ie 1.5) : "))
-#max_instances = int(input("Enter the Max instances that should ever exist for this application (ie. 20) : "))
-userid = input('Enter the username for the DCOS cluster : ')
-password = input('Enter the password for the DCOS cluster : ')
-marathon_app = input("Enter the Marathon Application Name to Configure Autoscale for from the Marathon UI : ")
+dcos_master = os.environ['AUTOSCALE_MARATHON_HOST']
+auth_enabled = os.getenv('AUTOSCALE_AUTH_ENABLED', 'false')
+userid = os.getenv('AUTOSCALE_USER_ID', '')
+password = os.getenv('AUTOSCALE_USER_PASSWORD', '')
+marathon_app = os.environ['AUTOSCALE_APP']
+max_mem_percent = int(os.environ['AUTOSCALE_MAX_MEM'])
+max_cpu_time = int(os.environ['AUTOSCALE_MAX_CPU'])
+trigger_mode = os.environ['AUTOSCALE_TRIGGER']
+max_instances = int(os.environ['AUTOSCALE_MAX_INSTANCES'])
+autoscale_multiplier = float(os.environ['AUTOSCALE_MULITPLIER'])
+scale_back_multiplier = 0.5
 
-max_mem_percent = 40
-max_cpu_time = 40
-trigger_mode = 'or'
-max_instances = 10
-autoscale_multiplier=4
+cpu_revert_coef=20
+memory_revert_coef=20
 
+cpu_to_revert=max_cpu_time - cpu_revert_coef
+memory_to_revert=max_mem_percent - memory_revert_coef
 
 class Marathon(object):
     def __init__(self, dcos_master,dcos_auth_token):
@@ -31,7 +33,7 @@ class Marathon(object):
         self.apps = self.get_all_apps()
 
     def get_all_apps(self):
-        response = requests.get(self.uri + '/service/marathon/v2/apps', headers=self.headers, verify=False).json()
+        response = requests.get(self.uri + '/v2/apps', headers=self.headers, verify=False).json()
         if response['apps'] ==[]:
             print ("No Apps found on Marathon")
             sys.exit(1)
@@ -44,7 +46,7 @@ class Marathon(object):
             return apps
 
     def get_app_details(self, marathon_app):
-        response = requests.get(self.uri + '/service/marathon/v2/apps/'+ marathon_app, headers=self.headers, verify=False).json()
+        response = requests.get(self.uri + '/v2/apps/'+ marathon_app, headers=self.headers, verify=False).json()
         if (response['app']['tasks'] ==[]):
             print ('No task data on Marathon for App !', marathon_app)
         else:
@@ -57,7 +59,7 @@ class Marathon(object):
                 hostid = i['host']
                 slaveId=i['slaveId']
                 print ('DEBUG - taskId=', taskid +' running on '+hostid + 'which is Mesos Slave Id '+slaveId)
-                app_task_dict[str(taskid)] = str(slaveId)
+                app_task_dict[str(taskid)] = [str(slaveId), str(hostid)]
             return app_task_dict
 
     def scale_app(self,marathon_app,autoscale_multiplier):
@@ -71,7 +73,7 @@ class Marathon(object):
         data ={'instances': target_instances}
         json_data=json.dumps(data)
         #headers = {'Content-type': 'application/json'}
-        response=requests.put(self.uri + '/service/marathon/v2/apps/'+ marathon_app, json_data,headers=self.headers,verify=False)
+        response=requests.put(self.uri + '/v2/apps/'+ marathon_app, json_data,headers=self.headers,verify=False)
         print ('Scale_app return status code =', response.status_code)
 
 def dcos_auth_login(dcos_master,userid,password):
@@ -84,12 +86,13 @@ def dcos_auth_login(dcos_master,userid,password):
     auth_token=response['token']
     return auth_token
 
-def get_task_agentstatistics(task, agent):
+def get_task_agentstatistics(task, agent, host):
     # Get the performance Metrics for all the tasks for the Marathon App specified
     # by connecting to the Mesos Agent and then making a REST call against Mesos statistics
     # Return to Statistics for the specific task for the marathon_app
     dcos_headers={'Authorization': 'token='+dcos_auth_token, 'Content-type': 'application/json'}
-    response = requests.get(dcos_master + '/slave/' + agent + '/monitor/statistics.json', verify=False, headers=dcos_headers, allow_redirects=True).json()
+    response = requests.get('http://' + host + ':5051' + '/monitor/statistics.json', verify=False, headers=dcos_headers, allow_redirects=True).json()
+    print(response)
     # print ('DEBUG -- Getting Mesos Metrics for Mesos Agent =',agent)
     for i in response:
         executor_id = i['executor_id']
@@ -104,9 +107,13 @@ def timer():
     return
 
 if __name__ == "__main__":
-    print ("This application tested with Python3 only")
-    dcos_auth_token=dcos_auth_login(dcos_master,userid,password)
-    print('Auth Token is = ' + dcos_auth_token)
+
+    if auth_enabled == 'true':
+        print ("This application tested with Python3 only")
+        dcos_auth_token=dcos_auth_login(dcos_master,userid,password)
+        print('Auth Token is = ' + dcos_auth_token)
+    else:
+        dcos_auth_token=''
 
     running=1
     while running == 1:
@@ -130,13 +137,18 @@ if __name__ == "__main__":
 
         app_cpu_values = []
         app_mem_values = []
-        for task,agent in app_task_dict.items():
+        for task, data in app_task_dict.items():
             #cpus_time =(task_stats['cpus_system_time_secs']+task_stats['cpus_user_time_secs'])
             #print ("Combined Task CPU Kernel and User Time for task", task, "=", cpus_time)
+            agent = data[0]
+            host = data[1]
+
             print('Task = '+ task)
             print ('Agent = ' + agent)
+            print ('Host = ' + host)
+
             # Compute CPU usage
-            task_stats = get_task_agentstatistics(task, agent)
+            task_stats = get_task_agentstatistics(task, agent, host)
             if task_stats != None:
                 cpus_system_time_secs0 = float(task_stats['cpus_system_time_secs'])
                 cpus_user_time_secs0 = float(task_stats['cpus_user_time_secs'])
@@ -148,7 +160,7 @@ if __name__ == "__main__":
 
             time.sleep(1)
 
-            task_stats = get_task_agentstatistics(task, agent)
+            task_stats = get_task_agentstatistics(task, agent, host)
             if task_stats != None:
                 cpus_system_time_secs1 = float(task_stats['cpus_system_time_secs'])
                 cpus_user_time_secs1 = float(task_stats['cpus_user_time_secs'])
@@ -198,12 +210,18 @@ if __name__ == "__main__":
             if (app_avg_cpu > max_cpu_time) and (app_avg_mem > max_mem_percent):
                 print ("Autoscale triggered based on 'both' Mem & CPU exceeding threshold")
                 aws_marathon.scale_app(marathon_app, autoscale_multiplier)
+            elif (app_avg_cpu < cpu_to_revert) and (app_avg_mem < memory_to_revert):
+                print ("Autoscale triggered based on 'both' Mem & CPU exceeding threshold. Reverting")
+                aws_marathon.scale_app(marathon_app, scale_back_multiplier)
             else:
                 print ("Both values were not greater than autoscale targets")
         elif (trigger_mode == "or"):
             if (app_avg_cpu > max_cpu_time) or (app_avg_mem > max_mem_percent):
                 print ("Autoscale triggered based Mem 'or' CPU exceeding threshold")
                 aws_marathon.scale_app(marathon_app, autoscale_multiplier)
+            elif (app_avg_cpu < cpu_to_revert) or (app_avg_mem < memory_to_revert):
+                print ("Autoscale triggered based Mem 'or' CPU exceeding threshold. Reverting") 
+                aws_marathon.scale_app(marathon_app, scale_back_multiplier)
             else:
                 print ("Neither Mem 'or' CPU values exceeding threshold")
         timer()
